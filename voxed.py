@@ -8,11 +8,14 @@ import argparse
 import os
 import datetime
 import re
+import wave
 import numpy as np
 from scipy.io import wavfile
 import scipy.signal as signal
+import scipy.linalg as linalg
 import subprocess
 import sys
+import gc
 import concurrent.futures
 from tqdm import tqdm
 
@@ -68,32 +71,51 @@ def run_ffmpeg_convert(input_path):
         log(f"  [ERROR] An unexpected error occurred during conversion: {e}")
         sys.exit(1)
 
-# ==================== LPC & Formant Magic ====================
-def levinson_durbin(r, order):
-    a = np.zeros((order + 1, order + 1))
-    e = np.zeros(order + 1)
-    a[0, 0] = 1.0
-    e[0] = r[0]
-    for m in range(1, order + 1):
-        k = - (r[m] + np.dot(a[1:m, m-1], r[1:m][::-1])) / e[m-1]
-        a[0, m] = 1.0
-        a[1:m, m] = a[1:m, m-1] + k * a[m-1:0:-1, m-1]
-        a[m, m] = k
-        e[m] = e[m-1] * (1 - k**2)
-    return a[1:, -1], e[-1]
+def write_wav_chunked(out_path, sr, processed_map):
+    """Writes a memory-mapped array to a WAV file in chunks to save RAM."""
+    n_samples = len(processed_map)
+    chunk_size = 1024 * 1024 # 1M samples at a time
+    
+    with wave.open(out_path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2) # 16-bit
+        wf.setframerate(sr)
+        
+        for i in range(0, n_samples, chunk_size):
+            end = min(i + chunk_size, n_samples)
+            chunk = (processed_map[i:end] * 32767).astype(np.int16)
+            wf.writeframes(chunk.tobytes())
 
+# ==================== LPC & Formant Magic ====================
 def get_lpc_poles(audio_frame, order=14):
     pre = np.append(audio_frame[0], audio_frame[1:] - 0.975 * audio_frame[:-1])
     corr = np.correlate(pre, pre, mode='full')
     r = corr[len(corr)//2 : len(corr)//2 + order + 1]
-    a, _ = levinson_durbin(r, order)
-    poles = np.roots(np.concatenate(([1.0], a)))
-    return poles[np.abs(poles) < 0.985]
+    
+    # Solve Yule-Walker equations using solve_toeplitz
+    try:
+        a = linalg.solve_toeplitz((r[:-1], r[:-1]), -r[1:])
+        poles = np.roots(np.concatenate(([1.0], a)))
+        return poles
+    except linalg.LinAlgError:
+        return np.array([])
 
 def shift_poles(poles, alpha=1.0, bw_scale=1.0):
     r = np.abs(poles)
     theta = np.angle(poles)
-    return (r ** bw_scale) * np.exp(1j * theta * alpha)
+    # Only shift poles in the upper half plane to avoid doubling
+    mask = theta > 0
+    theta[mask] *= alpha
+    r[mask] = r[mask] ** bw_scale
+    # Return as new poles (complex)
+    return r * np.exp(1j * theta)
+
+def poles_to_poly(poles):
+    # Ensure conjugate pairs for real coefficients
+    upper_poles = poles[np.angle(poles) >= 0]
+    all_poles = np.concatenate([upper_poles, np.conj(upper_poles)])
+    poly = np.poly(all_poles)
+    return np.real(poly)
 
 def stft(x, n_fft=1024, hop=256):
     return signal.stft(x, nperseg=n_fft, noverlap=n_fft-hop, window='hann', return_onesided=False)
@@ -120,81 +142,111 @@ def human_vocal_template(sr, n_fft=1024, bias=1.0, vowel='neutral'):
 
 def generate_glottal_excitation(sr, length, f0, model='klatt', rd=1.0, vibrato=0.0, jitter=0.0, shimmer=0.0):
     t = np.arange(length) / sr
+    
+    # Fundamental frequency with vibrato
+    vib_mod = 1 + vibrato * np.sin(2 * np.pi * 5.8 * t)
+    
+    # Phase calculation (handling jitter)
+    if jitter > 0:
+        jitter_noise = jitter * np.random.randn(length)
+        inst_f0 = f0 * vib_mod * (1 + jitter_noise)
+    else:
+        inst_f0 = f0 * vib_mod
+    
+    phase = np.cumsum(inst_f0 / sr) % 1.0
+    
+    # Excitation generation
     excitation = np.zeros(length, dtype=np.float32)
-    phase = 0.0
-    period = sr / f0
-    for i in range(length):
-        period_var = period * (1 + jitter * np.random.randn()) if jitter > 0 else period
-        phase = np.mod(phase + 1/period_var, 1.0)
-        vib = 1 + vibrato * np.sin(2 * np.pi * 5.8 * t[i])
-        if model == 'klatt':
-            if phase < 0.7:
-                excitation[i] = phase**2 * np.exp(-3.8 * phase)
-            else:
-                ret = (phase - 0.7) / 0.3
-                excitation[i] = np.exp(-rd * ret * 9)
-        elif model == 'rosenberg':
-            if phase < 0.6:
-                excitation[i] = 0.5 * (1 - np.cos(np.pi * phase / 0.6))
-            else:
-                ret = (phase - 0.6) / 0.4
-                excitation[i] = 0.5 * (1 + np.cos(np.pi * ret)) * np.exp(-rd * ret * 6)
-        elif model == 'lf':
-            if phase < 0.5:
-                excitation[i] = np.sin(np.pi * phase * 2) * 1.3
-            else:
-                ret = (phase - 0.5) / 0.5
-                excitation[i] = -np.exp(-rd * ret * 14)
-        if shimmer > 0:
-            excitation[i] *= (1 + shimmer * np.random.randn() * 0.6)
+    
+    if model == 'klatt':
+        mask1 = phase < 0.7
+        excitation[mask1] = (phase[mask1]**2) * np.exp(-3.8 * phase[mask1])
+        mask2 = phase >= 0.7
+        ret = (phase[mask2] - 0.7) / 0.3
+        excitation[mask2] = np.exp(-rd * ret * 9)
+        
+    elif model == 'rosenberg':
+        mask1 = phase < 0.6
+        excitation[mask1] = 0.5 * (1 - np.cos(np.pi * phase[mask1] / 0.6))
+        mask2 = phase >= 0.6
+        ret = (phase[mask2] - 0.6) / 0.4
+        excitation[mask2] = 0.5 * (1 + np.cos(np.pi * ret)) * np.exp(-rd * ret * 6)
+        
+    elif model == 'lf':
+        mask1 = phase < 0.5
+        excitation[mask1] = np.sin(np.pi * phase[mask1] * 2) * 1.3
+        mask2 = phase >= 0.5
+        ret = (phase[mask2] - 0.5) / 0.5
+        excitation[mask2] = -np.exp(-rd * ret * 14)
+        
+    if shimmer > 0:
+        shimmer_noise = 1 + shimmer * np.random.randn(length) * 0.6
+        excitation *= shimmer_noise
+        
     return excitation
 
 def apply_voice_morph_chunk(audio_chunk, sr, intensity=70, metallic=40, voicing=65,
                            pitch_shift=0, vowel='neutral', formant_bias=1.0,
                            glottal_model='klatt', rd=1.0, vibrato=0.0, jitter=0.0, shimmer=0.0,
-                           whisper_mode=False):
+                           whisper_mode=False, freq_mask=None):
     """Full core processing with all magic"""
     audio = audio_chunk.astype(np.float32) / (np.max(np.abs(audio_chunk)) + 1e-8)
-    intensity = np.clip(intensity / 100.0, 0.01, 1.0)
-    metallic = np.clip(metallic / 100.0, 0.0, 1.0)
-    voicing = np.clip(voicing / 100.0, 0.0, 1.0)
+    intensity_norm = np.clip(intensity / 100.0, 0.01, 1.0)
+    metallic_norm = np.clip(metallic / 100.0, 0.0, 1.0)
+    voicing_norm = np.clip(voicing / 100.0, 0.0, 1.0)
     
     n_fft, hop = 1024, 256
     _, _, Zxx = stft(audio, n_fft=n_fft, hop=hop)
     mag = np.abs(Zxx)
     phase = np.angle(Zxx)
     
+    # Frequency Masking (Forensics Filtering)
+    if freq_mask:
+        low_hz, high_hz = freq_mask
+        freqs = np.fft.fftfreq(n_fft, d=1/sr)
+        mask = (np.abs(freqs) >= low_hz) & (np.abs(freqs) <= high_hz)
+        mag *= mask.reshape(-1, 1)
+    
+    # 1. Formant Hijacking (Spectral Envelope Replacement)
     source_env = get_cepstral_envelope(mag)
     target_env = human_vocal_template(sr, n_fft=n_fft, bias=formant_bias, vowel=vowel).reshape(-1, 1)
     
-    morph_power = intensity**1.1 if whisper_mode else intensity**1.2
-    morphed = (1 - morph_power) * mag + morph_power * source_env * target_env * (7.8 if whisper_mode else 7.0)
+    # Normalize envelopes
+    source_env /= (np.mean(source_env, axis=0) + 1e-8)
+    target_env /= (np.mean(target_env) + 1e-8)
     
-    # LPC pole refinement (protects faint speech)
-    if intensity > 0.35 or whisper_mode:
+    # Morph power
+    morph_power = intensity_norm**1.2
+    
+    # De-envelope and Re-envelope
+    residual = mag / (source_env + 1e-8)
+    morphed = (1 - morph_power) * mag + morph_power * residual * target_env * (1.25 if whisper_mode else 1.0)
+    
+    # 2. LPC Pole Shifting Gain (Refinement)
+    if intensity_norm > 0.4 or whisper_mode:
         for i in range(0, len(audio)-n_fft, hop):
             frame = audio[i:i+n_fft]
-            if np.std(frame) < (0.01 if whisper_mode else 0.015): continue
+            if np.std(frame) < (0.008 if whisper_mode else 0.012): continue
             poles = get_lpc_poles(frame)
-            if len(poles) >= 5:
-                alpha = formant_bias * (0.9 + 0.4 * intensity)
-                morphed[:, i//hop] *= (1.18 if whisper_mode else 1.1)
+            if len(poles) >= 4:
+                morphed[:, i//hop] *= (1.25 if whisper_mode else 1.15)
     
-    # Glottal excitation
-    if voicing > 0.08:
-        base_f0 = 108 * (2 ** (pitch_shift / 12.0))
+    # 3. Glottal Excitation Injection
+    if voicing_norm > 0.1:
+        base_f0 = 105 * (2 ** (pitch_shift / 12.0))
         glottal = generate_glottal_excitation(sr, len(audio), base_f0, glottal_model, rd, vibrato, jitter, shimmer)
         _, _, Gxx = stft(glottal, n_fft=n_fft, hop=hop)
-        gain = 5.0 if whisper_mode else 4.3
-        morphed *= (1 + voicing * gain * np.abs(Gxx))
+        morphed *= (1 + voicing_norm * 4.5 * np.abs(Gxx))
     
-    final_mag = (1 - metallic) * morphed + metallic * mag * 1.35
+    final_mag = (1 - metallic_norm) * morphed + metallic_norm * mag * 1.2
     final_mag = signal.medfilt2d(np.abs(final_mag), kernel_size=(3,1))
     
     Zxx_new = final_mag * np.exp(1j * phase)
     processed = istft(Zxx_new, hop=hop)
+    
+    # Saturation
     processed = processed / (np.max(np.abs(processed)) + 1e-8)
-    processed = np.tanh(processed * (1.65 + intensity * 2.5))
+    processed = np.tanh(processed * (1.8 + intensity_norm * 2.2))
     return (processed * 0.9).astype(np.float32)
 
 def load_audio_mapped(file_path):
@@ -239,8 +291,6 @@ def load_audio_mapped(file_path):
 
         log(f"  [INFO] Format: {channels} ch | {sr} Hz | {bit_depth} bit")
         dtype = np.int16 if bit_depth == 16 else np.float32
-        if bit_depth == 24:
-            log("  [WARN] 24-bit WAV detected. This script is optimized for 16-bit or 32-bit float. Results may be distorted.")
         
         num_samples = data_size // (channels * (bit_depth // 8))
         audio_map = np.memmap(file_path, dtype=dtype, mode='r', offset=data_offset, shape=(num_samples, channels) if channels > 1 else (num_samples,))
@@ -299,8 +349,16 @@ def process_large_file(audio_map, sr, chunk_sec=30, num_workers=6, **kwargs):
 
     log("Normalizing overlapping regions...")
     processed_map /= np.maximum(weights_map, 1e-8)
+    
+    # Close and delete maps properly for Windows
     weights_map._mmap.close()
-    os.remove(weights_path)
+    del weights_map
+    gc.collect()
+    try:
+        os.remove(weights_path)
+    except:
+        pass
+        
     log("  [OK] Normalization complete.")
     return processed_map, out_path
 
@@ -324,7 +382,7 @@ def main():
     parser.add_argument("-v", "--voicing", type=int, default=80, help="1-100")
     parser.add_argument("-ps", "--pitchshift", type=float, default=0)
     parser.add_argument("--vowel", choices=['neutral','a','e','i','o','u'], default='neutral')
-    parser.add_argument("--formant", type=float, default=1.15, help="0.7-1.45")
+    parser.add_argument("--formant", type=float, default=1.15, dest="formant_bias", help="0.7-1.45")
     
     parser.add_argument("--glottal", choices=['simple','klatt','rosenberg','lf'], default='klatt')
     parser.add_argument("--rd", type=float, default=0.9, help="0.5-2.5")
@@ -354,14 +412,13 @@ def main():
         args.intensity = 90; args.metallic = 32; args.voicing = 92; args.pitchshift = 4
         log("  [INFO] Applied Preset 3: Strong Recovery")
     elif args.preset4:
-        args.intensity = 98; args.metallic = 55; args.voicing = 96; args.pitchshift = -0.8; args.formant = 1.25; args.whisper_mode = True
+        args.intensity = 98; args.metallic = 55; args.voicing = 96; args.pitchshift = -0.8; args.formant_bias = 1.25; args.whisper_mode = True
         log("  [INFO] Applied Preset 4: Extreme Hallucination")
     
     # Load audio
     try:
         audio_map, sr, temp_wav_path = load_audio_mapped(args.input)
     except Exception as e:
-        # load_audio_mapped already logs details
         sys.exit(1)
     
     # Handle time trimming
@@ -376,7 +433,6 @@ def main():
             start_idx = int(start_sec * sr)
             end_idx = int(end_sec * sr)
             
-            # Bounds check
             total_samples = len(audio_map)
             start_idx = max(0, min(start_idx, total_samples))
             end_idx = max(start_idx, min(end_idx, total_samples))
@@ -395,7 +451,7 @@ def main():
     
     processed_map, temp_raw_path = process_large_file(audio_map, sr, chunk_sec=args.chunk, num_workers=args.threads,
                                    intensity=args.intensity, metallic=args.metallic, voicing=args.voicing,
-                                   pitch_shift=args.pitchshift, vowel=args.vowel, formant_bias=args.formant,
+                                   pitch_shift=args.pitchshift, vowel=args.vowel, formant_bias=args.formant_bias,
                                    glottal_model=args.glottal, rd=args.rd, vibrato=args.vibrato,
                                    jitter=args.jitter, shimmer=args.shimmer, whisper_mode=args.whisper_mode)
     
@@ -404,15 +460,20 @@ def main():
     
     log(f"Saving final output: {out_path}")
     try:
-        # We process the final write in chunks to be memory safe
-        wavfile.write(out_path, sr, (processed_map[:] * 32767).astype(np.int16))
+        write_wav_chunked(out_path, sr, processed_map)
         log("  [OK] Final file written successfully.")
     except Exception as e:
         log(f"  [ERROR] Failed to save final output: {e}")
     
     log("Cleaning up temporary resources...")
     try:
+        # Close and delete maps properly for Windows
         processed_map._mmap.close()
+        audio_map._mmap.close()
+        del processed_map
+        del audio_map
+        gc.collect()
+        
         os.remove(temp_raw_path)
         if temp_wav_path and os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
@@ -423,5 +484,4 @@ def main():
     log(f"=== Process Finished: {out_path} ===")
 
 if __name__ == "__main__":
-    # Prevent multi-processing issues on Windows
     main()
